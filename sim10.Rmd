@@ -1,0 +1,150 @@
+---
+title: Signal Detection Analysis of Anjali's Data
+author: Jeff Rouder
+date: September 27, 2017
+output: html_document
+---
+In anticipation of data analysis, let's just simulate data with known truths.  Subjects produce recognition memory responses on a 6-point confidence-rating scale from *sure new* to *sure old*.   Words are studied twice, once, or are new (studied nonce).  So, there are three study conditions, which are also hard coded.
+
+Alright, let $d_{ij}$ denote the normal center for the $i$th participant in the $j$th condition, $i=1,\ldots,I$, $j=1,\ldots,3$.  For a six-point scale scale, 5 criteria are natural.  Yet, it is convenient to use seven and let the first and last be $-\infty$ and $\infty$, respectively.  Let $c_{i\ell}$ denote the $\ell$th criteria, \ell=1,\ldots,7, for the $i$th participant with $c_{i1}=-\infty$ and $c_{i7}=\infty$.  Let $Y_{ijk}$, be the response on for the $i$th participant in the $j$th condition, $k$th replicate, with $X=1,\ldots,6$.  We follow the Morey et al. (2008, JMP, Problematic effects....). After a bunch of experimenting and some hair pulling, these researchers found the most convenient parameterization is one where the penultinate criteria are fixed to 0 and 1 to locate and scale the space.  Hence $c_{2i}=0$ and $c_{6i}=1$.  The variance for the different conditions are denoted $\sigma^2_j$.  With this, the main signal detection equation is given by
+$$
+P(Y_{ijk}=x) = \Phi\left(\frac{c_{i,x+1}-d_{ij}}{\sigma_j}\right) - \Phi\left(\frac{c_{i,x}-d_{ij}}{\sigma_j}\right).
+$$
+
+For now, let's fit an EVSD model, e.g., $\sigma^2_j=\sigma^2$.
+
+
+```{r message=F}
+library(MCMCpack)
+library(msm)
+```
+
+Let's make data:
+```{r}
+I=20 #subjects
+J=3 #conditions
+K=100 # replicates per study condition
+ 
+
+t.s2=.6
+t.d=array(dim=c(I,J))
+t.d[,1]=runif(I,-.7,0)
+t.d[,2]=runif(I,.5,1)
+t.d[,3]=runif(I,1,1.5)
+
+t.crit=matrix(nrow=I,ncol=7,rep(c(-Inf,0,.2,.5,.7,1,Inf),I),byrow=T) 
+
+t.p=y=array(dim=c(I,J,6))
+
+for (i in 1:I){
+  t.p[i,,]=t(apply(outer(t.crit[i,],t.d[i,],pnorm,sd=sqrt(t.s2)),2,diff))
+  for (j in 1:J) y[i,j,]=rmultinom(1,K,t.p[i,j,])
+  }
+
+#flat field version:
+count=1
+N=sum(y)
+sub=cond=resp=1:N
+for (i in 1:I)
+  for (j in 1:J)
+    for (c in 1:6)
+      if (y[i,j,c]>0)
+        {
+          for (r in 1:y[i,j,c]){
+            sub[count]=i
+            cond[count]=j
+            resp[count]=c
+            count=count+1}
+      }
+```
+
+
+And let's fit this little data set.  A nonhierarchical signal equal-variance signal detection model. 
+$$
+\begin{aligned}
+d_{ij} & \sim \mbox{N}(a_1,a_2)\\
+\pi(c_{i\ell}) & \propto 1\\
+\sigma^2 & \sim \mbox{InvGamma}(b_1,b_2)
+\end{aligned}
+$$
+
+Analysis.  I am going to use both data set ups here to speed things along.
+
+```{r}
+M=500
+
+d=array(dim=c(M,I,J))
+crit=array(dim=c(M,I,7))
+crit[,,1]=rep(-Inf,I*M)
+crit[,,2]=rep(0,I*M)
+crit[,,6]=rep(1,I*M)
+crit[,,7]=rep(Inf,I*M)
+s2=1:M
+
+d[1,,]=t.d
+crit[1,,]=t.crit
+s2[1]=t.s2
+
+a1=.5
+a2=1
+b1=1
+b2=1
+
+cand=rep(NA,7)
+cand[c(1,2,6,7)]=c(-Inf,0,1,Inf)
+
+
+count=rep(0,I)
+sdTune=.003
+
+
+lpost=function(c0,d0,s20,y0) {
+  p=t(apply(outer(c0,d0,pnorm,sqrt(s20)),2,diff))
+  terms=(N*log(p))
+  terms=ifelse(is.na(terms),0,terms)
+  sum(terms)
+}
+
+for (m in 2:M){
+  # latent w
+  lower=crit[cbind(rep(m-1,N),sub,resp)]
+  upper=crit[cbind(rep(m-1,N),sub,resp+1)]
+  mn=d[cbind(rep(m-1,N),sub,cond)]
+  w=rtnorm(N,mn,sd=sqrt(s2[m-1]),lower,upper)
+  for (i in 1:I){
+    #d given w
+    sm=tapply(w[sub==i],cond[sub==i],sum)
+    v=1/(K/s2[m-1]+1/a2)
+    c=sm/s2[m-1]+a1/a2
+    d[m,i,]=rnorm(J,v*c,sqrt(v))
+    #Criteria given Y
+    crit[m,i,]=crit[m-1,i,]
+    cand[3:5]=rnorm(3,crit[m,i,3:5],sdTune)
+    if (mean(diff(cand)>0)==1){
+      curV=lpost(crit[m,i,],d[m,i,],s2[m-1],y[i,,])
+      candV=lpost(cand,d[m,i,],s2[m-1],y[i,,])
+      p=min(1,exp(candV-curV))
+      if (rbinom(1,1,p)){
+        crit[m,i,]=cand
+        count[i]=count[i]+1}
+      }
+  }
+  #sigma^2 | ....
+  MSE=sum((w-d[cbind(rep(m,N),sub,cond)])^2)
+  s2[m]=rinvgamma(1,shape=N/2+b1,scale=MSE/2+b2)
+}
+
+```
+
+
+How did we do?
+```{r}
+pm.d=apply(d,c(2,3),mean)
+plot(t.d,pm.d)
+abline(0,1)
+pm.crit=apply(crit,c(2,3),mean)
+plot(t.crit,pm.crit)
+abline(0,1)
+print(count/M)
+plot(s2,typ='l')
+```
